@@ -56,7 +56,7 @@ def load_model():
     try:
         from vieneu import Vieneu
         print(f"[INFO] Đang load model từ: {MERGED_MODEL_DIR_ABS}")
-        tts_model = Vieneu(backbone_repo=MERGED_MODEL_DIR_ABS)
+        tts_model = Vieneu(mode="standard", backbone_repo=MERGED_MODEL_DIR_ABS, gguf_filename=None)
         print("[INFO] ✅ Load model thành công!")
     except ImportError:
         model_load_error = (
@@ -114,9 +114,24 @@ def generate_audio(text):
         ref_audio = REF_AUDIO_PATH_ABS if os.path.isfile(REF_AUDIO_PATH_ABS) else None
 
         if ref_audio:
+            # Tự động đọc file text cùng tên
+            ref_text_path = os.path.splitext(REF_AUDIO_PATH_ABS)[0] + ".txt"
+            ref_text = ""
+            if os.path.isfile(ref_text_path):
+                with open(ref_text_path, "r", encoding="utf-8") as f:
+                    ref_text = f.read().strip()
+            
+            if not ref_text:
+                return (
+                    None,
+                    f"⚠️ Lỗi: Có file âm thanh mẫu nhưng chưa có văn bản. Hãy tạo file '{os.path.basename(ref_text_path)}' (cùng chỗ với file âm thanh) và ghi nội dung vào đó.",
+                    gr.update(interactive=True),
+                )
+
             wav = tts_model.infer(
                 text=text,
                 ref_audio=ref_audio,
+                ref_text=ref_text,
             )
         else:
             wav = tts_model.infer(text=text)
