@@ -1,0 +1,12 @@
+# VieNeu-TTS Demo — Dependencies
+# ============================================================================
+# Cài đặt: pip install -r requirements.txt
+# ============================================================================
+
+gradio>=4.0.0
+torch>=2.0.0
+soundfile>=0.12.0
+numpy>=1.24.0
+
+# VieNeu-TTS (cài theo hướng dẫn của model)
+# pip install vieneu

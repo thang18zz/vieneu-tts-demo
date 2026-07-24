@@ -1,0 +1,47 @@
+# ============================================================================
+# VieNeu-TTS Demo — .gitignore
+# ============================================================================
+
+# --- Model files (quá lớn cho Git) ---
+models/*
+!models/.gitkeep
+
+# --- Audio outputs ---
+outputs/*
+!outputs/.gitkeep
+
+# --- Reference audio ---
+reference/*
+!reference/.gitkeep
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+dist/
+build/
+*.egg
+
+# --- Virtual environments ---
+.venv/
+venv/
+env/
+ENV/
+
+# --- IDE ---
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# --- Jupyter ---
+.ipynb_checkpoints/
+*.ipynb
+
+# --- Logs ---
+*.log
