@@ -10,8 +10,7 @@ import os
 # --- Đường dẫn model & tài nguyên (⚠️ CHÈN Ở ĐÂY) ---
 MERGED_MODEL_DIR = "models/merged_model"       # thư mục merged_model đã tạo ở Bước 8
 LOSS_CHART_IMAGE = "assets/loss_chart.png"      # ảnh biểu đồ loss, để None hoặc "" nếu chưa có
-REF_AUDIO_PATH = "reference/ref_audio.wav"      # audio mẫu để clone giọng
-REF_TEXT = "Nội dung chính xác của file audio mẫu ở trên"  # text khớp 100% với ref audio
+REF_AUDIO_PATH = "reference/ref_audio.wav"      # audio mẫu (ứng dụng sẽ tự đọc file .txt cùng tên)
 
 OUTPUT_DIR = "outputs"                          # thư mục lưu audio sinh ra
 

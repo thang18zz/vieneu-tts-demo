@@ -98,16 +98,14 @@ pip install vieneu
 
 1. **Merged model** → Copy thư mục `merged_model/` vào `models/`
 2. **Audio tham chiếu** → Copy file `ref_audio.wav` vào `reference/`
-3. **Biểu đồ loss** *(tuỳ chọn)* → Copy ảnh vào `assets/loss_chart.png`
+3. **Văn bản tham chiếu** → Tạo file text cùng tên với file audio (ví dụ `ref_audio.txt`) trong thư mục `reference/`, nội dung là chuỗi văn bản khớp 100% với tiếng trong file audio.
+4. **Biểu đồ loss** *(tuỳ chọn)* → Copy ảnh vào `assets/loss_chart.png`
 
 ### Bước 5: Cập nhật cấu hình
 
-Mở file `config.py` và chỉnh sửa:
+Mở file `config.py` và chỉnh sửa thông số hiển thị:
 
 ```python
-# Text khớp 100% với nội dung file ref_audio.wav
-REF_TEXT = "Nội dung chính xác của file audio mẫu ở trên"
-
 # Chỉnh lại thông số huấn luyện cho đúng
 MODEL_INFO = {
     "Tên model": "My Voice — VieNeu-TTS Fine-tuned",
@@ -135,7 +133,6 @@ Tất cả cấu hình nằm trong file [`config.py`](config.py):
 | `MERGED_MODEL_DIR` | Đường dẫn thư mục model | `models/merged_model` |
 | `LOSS_CHART_IMAGE` | Đường dẫn ảnh biểu đồ loss | `assets/loss_chart.png` |
 | `REF_AUDIO_PATH` | File audio tham chiếu | `reference/ref_audio.wav` |
-| `REF_TEXT` | Nội dung text khớp với ref audio | *(cần chỉnh)* |
 | `OUTPUT_DIR` | Thư mục lưu audio sinh ra | `outputs` |
 | `MAX_TEXT_LENGTH` | Giới hạn ký tự input | `500` |
 | `MODEL_INFO` | Dict thông số hiển thị Tab 1 | *(chỉnh theo model)* |
