@@ -98,8 +98,7 @@ pip install vieneu
 
 1. **Merged model** → Copy thư mục `merged_model/` vào `models/`
 2. **Audio tham chiếu** → Copy file `ref_audio.wav` vào `reference/`
-3. **Văn bản tham chiếu** → Tạo file text cùng tên với file audio (ví dụ `ref_audio.txt`) trong thư mục `reference/`, nội dung là chuỗi văn bản khớp 100% với tiếng trong file audio.
-4. **Biểu đồ loss** *(tuỳ chọn)* → Copy ảnh vào `assets/loss_chart.png`
+3. **Biểu đồ loss** *(tuỳ chọn)* → Copy ảnh vào `assets/loss_chart.png`
 
 ### Bước 5: Cập nhật cấu hình
 
