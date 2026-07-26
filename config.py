@@ -14,9 +14,6 @@ REF_AUDIO_PATH = "reference/ref_audio.wav"      # audio mẫu (ứng dụng sẽ
 
 OUTPUT_DIR = "outputs"                          # thư mục lưu audio sinh ra
 
-# --- Giới hạn input ---
-MAX_TEXT_LENGTH = 500                           # số ký tự tối đa cho input
-
 # --- Thông số hiển thị ở Tab "Giới thiệu" (⚠️ CHÈN/CHỈNH lại cho đúng) ---
 MODEL_INFO = {
     "Tên model": "My Voice — VieNeu-TTS Fine-tuned",

@@ -1,3 +1,5 @@
+Mô hình chỉ phục vụ nghiên cứu học tập, không được sử dụng vào mục đích doanh nghiệp
+
 <div align="center">
 
 # 🎙️ VieNeu-TTS Demo
@@ -18,6 +20,16 @@ sử dụng model VieNeu-TTS đã được fine-tune bằng kỹ thuật LoRA.
 [Bắt đầu](#-cài-đặt) · [Tính năng](#-tính-năng) · [Cấu hình](#%EF%B8%8F-cấu-hình) · [Xử lý sự cố](#-xử-lý-sự-cố)
 
 </div>
+
+---
+
+## 🔊 Audio mẫu
+
+- [Nghe hoặc tải audio TTS mẫu](outputs/tts_20260726_111550.wav)
+
+## 📉 Biểu đồ loss
+
+![Biểu đồ loss của quá trình huấn luyện](assets/loss_chart.png)
 
 ---
 
@@ -134,7 +146,6 @@ Tất cả cấu hình nằm trong file [`config.py`](config.py):
 | `LOSS_CHART_IMAGE` | Đường dẫn ảnh biểu đồ loss | `assets/loss_chart.png` |
 | `REF_AUDIO_PATH` | File audio tham chiếu | `reference/ref_audio.wav` |
 | `OUTPUT_DIR` | Thư mục lưu audio sinh ra | `outputs` |
-| `MAX_TEXT_LENGTH` | Giới hạn ký tự input | `500` |
 | `MODEL_INFO` | Dict thông số hiển thị Tab 1 | *(chỉnh theo model)* |
 
 ---

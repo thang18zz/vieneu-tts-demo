@@ -9,6 +9,7 @@ models/*
 # --- Audio outputs ---
 outputs/*
 !outputs/.gitkeep
+!outputs/*.wav
 
 # --- Reference audio ---
 reference/*

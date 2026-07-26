@@ -12,6 +12,11 @@ Chạy: python app.py
 
 import os
 import sys
+if hasattr(sys.stdout, 'reconfigure'):
+    sys.stdout.reconfigure(encoding='utf-8')
+if hasattr(sys.stderr, 'reconfigure'):
+    sys.stderr.reconfigure(encoding='utf-8')
+
 import platform
 import subprocess
 import datetime
@@ -27,8 +32,100 @@ from config import (
     REF_AUDIO_PATH_ABS,
     OUTPUT_DIR_ABS,
     MODEL_INFO,
-    MAX_TEXT_LENGTH,
 )
+
+import re
+
+
+def normalize_annotations_for_tts(text: str) -> str:
+    """
+    Chuyển chú thích trong ngoặc thành một đơn vị ngữ điệu riêng.
+
+    Ví dụ:
+        "bản kỷ (chép sự tích các đế vương), còn phần"
+        -> "bản kỷ, chép sự tích các đế vương. còn phần"
+    """
+    if not text:
+        return text
+
+    # Xử lý từ ngoặc trong cùng ra ngoài để không làm mất nội dung khi có ngoặc lồng.
+    annotation_pattern = re.compile(r"\(\s*([^()]+?)\s*\)")
+    previous = None
+    while text != previous:
+        previous = text
+        text = annotation_pattern.sub(lambda match: f", {match.group(1).strip()}.", text)
+
+    # Dấu câu ngay sau ngoặc cũ không được tạo thành chuỗi ".,", ".;"...
+    text = re.sub(r"\.\s*[,;:]+\s*", ". ", text)
+    text = re.sub(r",\s*,+", ", ", text)
+    text = re.sub(r"\.{2,}", ".", text)
+    text = re.sub(r"\s+,", ",", text)
+    return text
+
+
+def normalize_text_for_tts(text: str) -> str:
+    """Chuẩn hóa văn bản trước khi đưa vào TTS."""
+    if not text:
+        return text
+
+    text = normalize_annotations_for_tts(text)
+
+    # 1. expand_units
+    replacements = {
+        'km/h': ' ki-lô-mét trên giờ',
+        'km': ' ki-lô-mét',
+        'm/s': ' mét trên giây',
+        'cm': ' xăng-ti-mét',
+        'mm': ' mi-li-mét',
+        'kg': ' ki-lô-gam',
+        'mg': ' mi-li-gam',
+        'ml': ' mi-li-lít',
+        'm²': ' mét vuông',
+        'm3': ' mét khối',
+        'm³': ' mét khối',
+        'đ': ' đồng',
+        'vnđ': ' đồng',
+        '°c': ' độ xê',
+        '%': ' phần trăm',
+        '$': ' đô la',
+        'usd': ' đô la',
+        'm': ' mét',
+    }
+
+    sorted_keys = sorted(replacements.keys(), key=len, reverse=True)
+
+    for k in sorted_keys:
+        escaped_k = re.escape(k)
+        if k[-1].isalnum() and k[-1] not in ('³', '²'):
+            pattern = r'(\d+(?:[.,]\d+)*)' + escaped_k + r'\b'
+        else:
+            pattern = r'(\d+(?:[.,]\d+)*)' + escaped_k
+
+        text = re.sub(pattern, r'\g<1>' + replacements[k], text, flags=re.IGNORECASE)
+
+    # 2. vinorm.TTSnorm
+    try:
+        from vinorm import TTSnorm
+        text = TTSnorm(text)
+    except ImportError:
+        pass
+    except Exception as e:
+        print(f"[WARN] Lỗi khi chạy vinorm.TTSnorm: {e}")
+
+    # 3. Lọc an toàn cuối — giữ lại dấu câu để model biết biên câu
+    # (xóa số, ký hiệu đặc biệt nhưng GIỮ: . , ! ? … ; : -)
+    text = re.sub(
+        r'[^a-zA-Záàảãạăắằẳẵặâấầẩẫậéèẻẽẹêếềểễệ'
+        r'íìỉĩịóòỏõọôốồổỗộơớờởỡợúùủũụưứừửữựýỳỷỹỵ'
+        r'đÁÀẢÃẠĂẮẰẲẴẶÂẤẦẨẪẬÉÈẺẼẸÊẾỀỂỄỆÍÌỈĨỊÓÒỎÕỌ'
+        r'ÔỐỒỔỖỘƠỚỜỞỠỢÚÙỦŨỤƯỨỪỬỮỰÝỲỶỸỴĐ\s.,!?\u2026;:-]',
+        '', text
+    )
+    # Dọn dấu câu bị lặp nhiều lần liên tiếp (vd "..." → "…" hoặc giữ nguyên "...")
+    text = re.sub(r'([.,!?;:-])\1{2,}', r'\1\1\1', text)  # tối đa 3 dấu liên tiếp
+    text = re.sub(r'\s+', ' ', text).strip()
+
+    return text
 
 # ============================================================================
 # 1. GLOBAL STATE
@@ -36,6 +133,47 @@ from config import (
 tts_model = None
 model_load_error = None
 last_generated_file = None  # lưu đường dẫn file audio mới nhất trong phiên
+
+# ============================================================================
+# 1b. MULTI-SENTENCE HELPERS
+# ============================================================================
+# Khoảng lặng giữa các câu khi ghép audio (giây). Chỉnh tuỳ phong cách đọc:
+#   0.10–0.15s → nói nhanh / podcast
+#   0.18–0.25s → đọc truyện bình thường  (mặc định)
+#   0.30–0.50s → nghe sách / chậm rãi
+INTER_SENTENCE_SILENCE_S = 0.20
+TTS_SAMPLE_RATE = 24000
+
+
+def split_sentences_vi(text: str) -> list:
+    """
+    Tách văn bản tiếng Việt thành danh sách câu đơn.
+    Dùng lookbehind để giữ dấu câu kết thúc (. ! ? …) kèm với câu trước.
+    Câu không kết thúc bằng dấu câu (phần còn lại) vẫn được giữ lại.
+
+    Ví dụ:
+        'Hôm nay trời đẹp. Bạn có khỏe không? Tôi khỏe!'
+        → ['Hôm nay trời đẹp.', 'Bạn có khỏe không?', 'Tôi khỏe!']
+    """
+    if not text:
+        return []
+    # Tách tại vị trí SAU dấu .  !  ?  … (và khoảng trắng sau đó)
+    parts = re.split(r'(?<=[.!?\u2026])\s+', text.strip())
+    return [p.strip() for p in parts if p.strip()]
+
+
+def _infer_one_sentence(text_norm: str, ref_audio: str, ref_text: str):
+    """Gọi tts_model.infer() cho 1 câu, trả về numpy float32 array."""
+    if ref_audio:
+        wav = tts_model.infer(text=text_norm, ref_audio=ref_audio, ref_text=ref_text)
+    else:
+        wav = tts_model.infer(text=text_norm)
+    if isinstance(wav, np.ndarray):
+        return wav.astype(np.float32)
+    if isinstance(wav, tuple) and len(wav) == 2:
+        return wav[1].astype(np.float32)
+    # fallback: đã là array-like
+    return np.array(wav, dtype=np.float32)
 
 # ============================================================================
 # 2. MODEL LOADING (một lần duy nhất khi khởi động)
@@ -55,16 +193,25 @@ def load_model():
 
     try:
         from vieneu import Vieneu
-        print(f"[INFO] Đang load model từ: {MERGED_MODEL_DIR_ABS}")
-        tts_model = Vieneu(mode="standard", backbone_repo=MERGED_MODEL_DIR_ABS, gguf_filename=None)
-        print("[INFO] ✅ Load model thành công!")
-    except ImportError:
+    except ImportError as e:
         model_load_error = (
-            "❌ Không tìm thấy thư viện 'vieneu'.\n"
+            f"❌ Không tìm thấy thư viện 'vieneu' hoặc thiếu dependencies.\n"
+            f"Lỗi: {e}\n"
             "Chạy: pip install vieneu\n"
             "rồi khởi động lại app."
         )
         print(f"[WARN] {model_load_error}")
+        return
+
+    try:
+        print(f"[INFO] Đang load model từ: {MERGED_MODEL_DIR_ABS}")
+        tts_model = Vieneu(
+            mode="standard",
+            backbone_repo=MERGED_MODEL_DIR_ABS,
+            gguf_filename=None,
+            codec_repo="neuphonic/neucodec"
+        )
+        print("[INFO] ✅ Load model thành công!")
     except Exception as e:
         model_load_error = (
             f"❌ Lỗi khi load model:\n{str(e)}\n\n"
@@ -77,25 +224,33 @@ def load_model():
 # ============================================================================
 # 3. AUDIO GENERATION
 # ============================================================================
-def generate_audio(text):
+def generate_audio(text, device_choice="CPU"):
     """
     Sinh audio từ văn bản.
+    Tự động tách câu → infer từng câu riêng → ghép với khoảng lặng tự nhiên.
+    Điều này tránh hiện tượng lặp từ và silence gap khi nhập nhiều câu.
     Returns: (audio_path | None, status_message, open_btn_interactive)
     """
     global last_generated_file
 
-    # --- Validate ---
+    # --- Switch Device ---
+    try:
+        import torch
+        if tts_model is not None and hasattr(tts_model, "backbone") and hasattr(tts_model.backbone, "to"):
+            if device_choice == "GPU" and torch.cuda.is_available():
+                tts_model.backbone.to("cuda")
+            else:
+                tts_model.backbone.to("cpu")
+    except Exception as e:
+        print(f"[WARN] Lỗi khi đổi device: {e}")
+
+    # --- Validate cơ bản ---
     if not text or not text.strip():
         return None, "⚠️ Vui lòng nhập văn bản.", gr.update(interactive=False)
 
-    text = text.strip()
-
-    if len(text) > MAX_TEXT_LENGTH:
-        return (
-            None,
-            f"⚠️ Văn bản quá dài ({len(text)} ký tự). Giới hạn: {MAX_TEXT_LENGTH} ký tự.",
-            gr.update(interactive=False),
-        )
+    # Chuẩn hóa chữ thường và biên chú thích trước khi chia câu/đưa vào model.
+    # casefold() xử lý Unicode ổn định và vẫn giữ nguyên dấu tiếng Việt/dấu câu.
+    text = normalize_annotations_for_tts(text.casefold())
 
     if tts_model is None:
         return (
@@ -104,63 +259,79 @@ def generate_audio(text):
             gr.update(interactive=False),
         )
 
-    # --- Generate ---
+    # --- Chuẩn bị ref audio / ref text ---
+    ref_audio = REF_AUDIO_PATH_ABS if os.path.isfile(REF_AUDIO_PATH_ABS) else None
+    ref_text = ""
+    if ref_audio:
+        ref_text_path = os.path.splitext(REF_AUDIO_PATH_ABS)[0] + ".txt"
+        if os.path.isfile(ref_text_path):
+            with open(ref_text_path, "r", encoding="utf-8") as f:
+                ref_text = f.read().strip()
+        if not ref_text:
+            return (
+                None,
+                f"⚠️ Lỗi: Có file âm thanh mẫu nhưng chưa có văn bản. "
+                f"Hãy tạo file '{os.path.basename(ref_text_path)}' "
+                f"(cùng chỗ với file âm thanh) và ghi nội dung vào đó.",
+                gr.update(interactive=True),
+            )
+
+    # --- Tách câu, normalize từng câu, infer từng câu ---
+    sentences = split_sentences_vi(text)
+    if not sentences:
+        sentences = [text]  # fallback: 1 câu = toàn bộ text
+
+    silence_samples = np.zeros(
+        int(TTS_SAMPLE_RATE * INTER_SENTENCE_SILENCE_S), dtype=np.float32
+    )
+    audio_parts = []
+    ok_count = 0
+    err_msgs = []
+
+    for i, sent in enumerate(sentences):
+        sent_norm = normalize_text_for_tts(sent)
+        if not sent_norm:
+            print(f"[INFO] Bỏ qua câu {i+1} (rỗng sau chuẩn hóa): '{sent[:60]}'")
+            continue
+        try:
+            print(f"[INFO] Đang sinh câu {i+1}/{len(sentences)}: '{sent_norm[:80]}'")
+            wav_arr = _infer_one_sentence(sent_norm, ref_audio, ref_text)
+            audio_parts.append(wav_arr)
+            audio_parts.append(silence_samples.copy())
+            ok_count += 1
+        except Exception as e:
+            err_msgs.append(f"Câu {i+1}: {str(e)[:120]}")
+            print(f"[WARN] Lỗi sinh câu {i+1}: {e}")
+            traceback.print_exc()
+            continue
+
+    if not audio_parts:
+        detail = "; ".join(err_msgs) if err_msgs else "Không rõ nguyên nhân."
+        return (
+            None,
+            f"❌ Không sinh được audio nào.\nChi tiết: {detail}",
+            gr.update(interactive=False),
+        )
+
+    # --- Ghép audio và lưu file ---
     try:
+        full_audio = np.concatenate(audio_parts)
         timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
         filename = f"tts_{timestamp}.wav"
         filepath = os.path.join(OUTPUT_DIR_ABS, filename)
-
-        # Kiểm tra ref audio
-        ref_audio = REF_AUDIO_PATH_ABS if os.path.isfile(REF_AUDIO_PATH_ABS) else None
-
-        if ref_audio:
-            # Tự động đọc file text cùng tên
-            ref_text_path = os.path.splitext(REF_AUDIO_PATH_ABS)[0] + ".txt"
-            ref_text = ""
-            if os.path.isfile(ref_text_path):
-                with open(ref_text_path, "r", encoding="utf-8") as f:
-                    ref_text = f.read().strip()
-            
-            if not ref_text:
-                return (
-                    None,
-                    f"⚠️ Lỗi: Có file âm thanh mẫu nhưng chưa có văn bản. Hãy tạo file '{os.path.basename(ref_text_path)}' (cùng chỗ với file âm thanh) và ghi nội dung vào đó.",
-                    gr.update(interactive=True),
-                )
-
-            wav = tts_model.infer(
-                text=text,
-                ref_audio=ref_audio,
-                ref_text=ref_text,
-            )
-        else:
-            wav = tts_model.infer(text=text)
-
-        # Lưu file
-        if isinstance(wav, np.ndarray):
-            sf.write(filepath, wav, samplerate=24000)
-        elif isinstance(wav, tuple) and len(wav) == 2:
-            sr, audio_data = wav
-            sf.write(filepath, audio_data, samplerate=sr)
-        elif isinstance(wav, str) and os.path.isfile(wav):
-            # Model trả về đường dẫn file
-            import shutil
-            shutil.copy2(wav, filepath)
-        else:
-            sf.write(filepath, wav, samplerate=24000)
-
+        sf.write(filepath, full_audio, samplerate=TTS_SAMPLE_RATE)
         last_generated_file = filepath
-        return (
-            filepath,
-            f"✅ Đã tạo thành công: {filename}",
-            gr.update(interactive=True),
-        )
+
+        status = f"✅ Đã tạo thành công: {filename} ({ok_count} câu)"
+        if err_msgs:
+            status += f"\n⚠️ {len(err_msgs)} câu bị lỗi: {'; '.join(err_msgs[:3])}"
+        return (filepath, status, gr.update(interactive=True))
 
     except Exception as e:
         traceback.print_exc()
         return (
             None,
-            f"❌ Lỗi khi tạo audio:\n{str(e)}",
+            f"❌ Lỗi khi ghép/lưu audio:\n{str(e)}",
             gr.update(interactive=False),
         )
 
@@ -619,6 +790,11 @@ footer {
     background-clip: text;
     animation: shimmer 2s linear infinite;
 }
+
+/* --- Hidden buttons for UI state management --- */
+.hidden-btn {
+    display: none !important;
+}
 """
 
 
@@ -635,6 +811,13 @@ def build_model_info_table():
 
 def build_app():
     """Build giao diện Gradio."""
+    has_gpu = False
+    try:
+        import torch
+        has_gpu = torch.cuda.is_available()
+    except Exception:
+        pass
+
     # Kiểm tra loss chart
     has_loss_chart = (
         LOSS_CHART_IMAGE_ABS
@@ -646,21 +829,6 @@ def build_app():
 
     with gr.Blocks(
         title=f"{model_name} — Demo",
-        css=CUSTOM_CSS,
-        theme=gr.themes.Base(
-            primary_hue=gr.themes.colors.purple,
-            secondary_hue=gr.themes.colors.cyan,
-            neutral_hue=gr.themes.colors.gray,
-            font=gr.themes.GoogleFont("Inter"),
-            font_mono=gr.themes.GoogleFont("JetBrains Mono"),
-        ).set(
-            body_background_fill="*neutral_950",
-            body_background_fill_dark="*neutral_950",
-            block_background_fill="*neutral_900",
-            block_background_fill_dark="*neutral_900",
-            input_background_fill="*neutral_900",
-            input_background_fill_dark="*neutral_900",
-        ),
     ) as demo:
 
         # ── Hero Section ──
@@ -760,6 +928,14 @@ def build_app():
                     interactive=model_ready,
                 )
 
+                with gr.Row():
+                    device_radio = gr.Radio(
+                        choices=["GPU", "CPU"] if has_gpu else ["CPU"],
+                        value="GPU" if has_gpu else "CPU",
+                        label="Thiết bị sinh (Device)",
+                        interactive=True,
+                    )
+
                 # Buttons row
                 with gr.Row():
                     generate_btn = gr.Button(
@@ -800,13 +976,67 @@ def build_app():
                     visible=False,
                 )
 
-                # ── Events ──
+                # ── Trạng thái và Nút ẩn cho xử lý đồng thời ──
+                is_generating = gr.State(False)
+                hidden_gen_btn = gr.Button("Hidden Gen", visible=True, elem_id="hidden_gen_btn", elem_classes="hidden-btn")
+                hidden_cancel_btn = gr.Button("Hidden Cancel", visible=True, elem_id="hidden_cancel_btn", elem_classes="hidden-btn")
+
+                # Cập nhật trạng thái: Nếu đang generate mà user sửa text, mở lại nút
+                text_input.change(
+                    fn=lambda is_gen: gr.update(interactive=True) if is_gen else gr.update(),
+                    inputs=[is_generating],
+                    outputs=[generate_btn],
+                )
+
+                # Nút hiển thị
                 generate_btn.click(
+                    fn=None,
+                    inputs=[is_generating],
+                    js="""(is_gen) => {
+                        function clickBtn(id) {
+                            let el = document.querySelector('#' + id);
+                            if (el && el.tagName !== 'BUTTON') el = el.querySelector('button') || el;
+                            if (el) el.click();
+                        }
+
+                        if (is_gen) {
+                            if (confirm('Bạn có muốn dừng tiến trình hiện tại để tạo giọng nói mới?')) {
+                                clickBtn('hidden_cancel_btn');
+                                setTimeout(() => {
+                                    clickBtn('hidden_gen_btn');
+                                }, 500);
+                            }
+                        } else {
+                            clickBtn('hidden_gen_btn');
+                        }
+                    }"""
+                )
+
+                # Xử lý sinh âm thanh (chạy khi ẩn)
+                set_state_evt = hidden_gen_btn.click(
+                    fn=lambda: (True, gr.update(interactive=False)),
+                    outputs=[is_generating, generate_btn],
+                )
+
+                gen_evt = set_state_evt.then(
                     fn=generate_audio,
-                    inputs=[text_input],
+                    inputs=[text_input, device_radio],
                     outputs=[audio_output, status_output, open_folder_btn],
                 )
 
+                gen_evt.then(
+                    fn=lambda: (False, gr.update(interactive=True)),
+                    outputs=[is_generating, generate_btn],
+                )
+
+                # Nút hủy
+                hidden_cancel_btn.click(
+                    fn=lambda: (False, gr.update(interactive=True), "⚠️ Tiến trình bị hủy để tạo mới."),
+                    outputs=[is_generating, generate_btn, status_output],
+                    cancels=[gen_evt],
+                )
+
+                # ── Sự kiện Mở thư mục ──
                 open_folder_btn.click(
                     fn=open_file_explorer,
                     inputs=[],
@@ -848,11 +1078,28 @@ def main():
 
     # Build & launch
     demo = build_app()
+    custom_theme = gr.themes.Base(
+        primary_hue=gr.themes.colors.purple,
+        secondary_hue=gr.themes.colors.cyan,
+        neutral_hue=gr.themes.colors.gray,
+        font=gr.themes.GoogleFont("Inter"),
+        font_mono=gr.themes.GoogleFont("JetBrains Mono"),
+    ).set(
+        body_background_fill="*neutral_950",
+        body_background_fill_dark="*neutral_950",
+        block_background_fill="*neutral_900",
+        block_background_fill_dark="*neutral_900",
+        input_background_fill="*neutral_900",
+        input_background_fill_dark="*neutral_900",
+    )
+
     demo.launch(
         server_name="127.0.0.1",
         server_port=7860,
         share=False,
         inbrowser=True,
+        css=CUSTOM_CSS,
+        theme=custom_theme,
     )
 
 
