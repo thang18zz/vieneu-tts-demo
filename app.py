@@ -36,6 +36,119 @@ from config import (
 
 import re
 
+_VI_DIGITS = (
+    "không",
+    "một",
+    "hai",
+    "ba",
+    "bốn",
+    "năm",
+    "sáu",
+    "bảy",
+    "tám",
+    "chín",
+)
+
+
+def _read_vi_triplet(value: int, force_hundreds: bool = False) -> str:
+    """Đọc một nhóm số từ 0 đến 999 bằng tiếng Việt."""
+    hundreds, remainder = divmod(value, 100)
+    tens, units = divmod(remainder, 10)
+    words = []
+
+    if hundreds or force_hundreds:
+        words.extend((_VI_DIGITS[hundreds], "trăm"))
+        if tens == 0 and units:
+            words.append("lẻ")
+
+    if tens >= 2:
+        words.extend((_VI_DIGITS[tens], "mươi"))
+        if units == 1:
+            words.append("mốt")
+        elif units == 4:
+            words.append("tư")
+        elif units == 5:
+            words.append("lăm")
+        elif units:
+            words.append(_VI_DIGITS[units])
+    elif tens == 1:
+        words.append("mười")
+        if units == 5:
+            words.append("lăm")
+        elif units:
+            words.append(_VI_DIGITS[units])
+    elif units and not (hundreds or force_hundreds):
+        words.append(_VI_DIGITS[units])
+    elif units:
+        words.append(_VI_DIGITS[units])
+
+    return " ".join(words)
+
+
+def integer_to_vietnamese(value: int) -> str:
+    """Đọc số nguyên không âm bằng tiếng Việt, hỗ trợ đến hàng tỷ tỷ."""
+    if value == 0:
+        return _VI_DIGITS[0]
+
+    scales = ("", "nghìn", "triệu", "tỷ", "nghìn tỷ", "triệu tỷ", "tỷ tỷ")
+    groups = []
+    while value:
+        value, group = divmod(value, 1000)
+        groups.append(group)
+
+    parts = []
+    highest = len(groups) - 1
+    for index in range(highest, -1, -1):
+        group = groups[index]
+        if not group:
+            continue
+        force_hundreds = index < highest and group < 100
+        spoken = _read_vi_triplet(group, force_hundreds=force_hundreds)
+        scale = scales[index] if index < len(scales) else ""
+        parts.append(f"{spoken} {scale}".strip())
+    return " ".join(parts)
+
+
+def normalize_numbers_for_tts(text: str) -> str:
+    """
+    Chuẩn hóa số trước khi lọc ký tự.
+
+    Dấu `,` hoặc `.` chỉ là dấu thập phân khi nằm sát giữa hai chữ số:
+    `2,3`/`2.3` -> `hai phẩy ba`; `2, 3` vẫn là một danh sách.
+    Phần thập phân được đọc từng chữ số để không làm mất số 0.
+    """
+    if not text:
+        return text
+
+    number_pattern = re.compile(r"(?<![\w])([+-]?)(\d+)(?:([.,])(\d+))?(?![\w])")
+
+    def _replace(match: re.Match) -> str:
+        sign, integer_part, decimal_mark, fractional_part = match.groups()
+        words = integer_to_vietnamese(int(integer_part))
+        if sign == "-":
+            words = f"âm {words}"
+        elif sign == "+":
+            words = f"dương {words}"
+        if decimal_mark:
+            fraction = " ".join(_VI_DIGITS[int(digit)] for digit in fractional_part)
+            words = f"{words} phẩy {fraction}"
+        return words
+
+    return number_pattern.sub(_replace, text)
+
+
+TTS_PUNCTUATION = frozenset(".,!?\u2026;:-")
+
+
+def ensure_trailing_punctuation(text: str) -> str:
+    """Thêm một dấu chấm nếu text không kết thúc bằng dấu câu TTS hỗ trợ."""
+    if not text:
+        return text
+    text = text.rstrip()
+    if text and text[-1] not in TTS_PUNCTUATION:
+        text += "."
+    return text
+
 
 def normalize_annotations_for_tts(text: str) -> str:
     """
@@ -103,7 +216,11 @@ def normalize_text_for_tts(text: str) -> str:
 
         text = re.sub(pattern, r'\g<1>' + replacements[k], text, flags=re.IGNORECASE)
 
-    # 2. vinorm.TTSnorm
+    # 2. Chuẩn hóa số dự phòng trước khi lọc ký tự. Bước này luôn chạy để số
+    # không bị mất khi môi trường không cài vinorm.
+    text = normalize_numbers_for_tts(text)
+
+    # 3. vinorm.TTSnorm
     try:
         from vinorm import TTSnorm
         text = TTSnorm(text)
@@ -112,7 +229,7 @@ def normalize_text_for_tts(text: str) -> str:
     except Exception as e:
         print(f"[WARN] Lỗi khi chạy vinorm.TTSnorm: {e}")
 
-    # 3. Lọc an toàn cuối — giữ lại dấu câu để model biết biên câu
+    # 4. Lọc an toàn cuối — giữ lại dấu câu để model biết biên câu
     # (xóa số, ký hiệu đặc biệt nhưng GIỮ: . , ! ? … ; : -)
     text = re.sub(
         r'[^a-zA-Záàảãạăắằẳẵặâấầẩẫậéèẻẽẹêếềểễệ'
@@ -125,7 +242,7 @@ def normalize_text_for_tts(text: str) -> str:
     text = re.sub(r'([.,!?;:-])\1{2,}', r'\1\1\1', text)  # tối đa 3 dấu liên tiếp
     text = re.sub(r'\s+', ' ', text).strip()
 
-    return text
+    return ensure_trailing_punctuation(text)
 
 # ============================================================================
 # 1. GLOBAL STATE
@@ -143,6 +260,69 @@ last_generated_file = None  # lưu đường dẫn file audio mới nhất trong
 #   0.30–0.50s → nghe sách / chậm rãi
 INTER_SENTENCE_SILENCE_S = 0.20
 TTS_SAMPLE_RATE = 24000
+
+
+def _edge_silence_seconds(wav: np.ndarray, sample_rate: int) -> tuple[float, float]:
+    """Đo khoảng lặng liên tục ở đầu/cuối waveform mà không cắt audio."""
+    audio = np.asarray(wav, dtype=np.float32).reshape(-1)
+    if audio.size == 0 or sample_rate <= 0:
+        return 0.0, 0.0
+
+    finite_audio = np.nan_to_num(audio, nan=0.0, posinf=0.0, neginf=0.0)
+    peak = float(np.max(np.abs(finite_audio)))
+    if peak == 0.0:
+        duration = finite_audio.size / sample_rate
+        return duration, duration
+
+    # Ngưỡng tương đối có sàn nhỏ để bỏ noise nền nhưng không ăn vào âm cuối.
+    threshold = max(1e-4, peak * 0.01)
+    voiced_indices = np.flatnonzero(np.abs(finite_audio) > threshold)
+    if voiced_indices.size == 0:
+        duration = finite_audio.size / sample_rate
+        return duration, duration
+
+    leading = int(voiced_indices[0]) / sample_rate
+    trailing = int(finite_audio.size - 1 - voiced_indices[-1]) / sample_rate
+    return leading, trailing
+
+
+def concatenate_with_adaptive_pauses(
+    chunks: list[np.ndarray],
+    sample_rate: int = TTS_SAMPLE_RATE,
+    target_pause_s: float = INTER_SENTENCE_SILENCE_S,
+) -> np.ndarray:
+    """
+    Ghép audio và chỉ bù silence còn thiếu tại mỗi biên.
+
+    Silence sẵn có ở cuối chunk trước và đầu chunk sau được tính vào khoảng nghỉ
+    mục tiêu. Không bao giờ append khoảng nghỉ liên câu sau chunk cuối.
+    """
+    if not chunks:
+        return np.array([], dtype=np.float32)
+
+    normalized_chunks = [
+        np.nan_to_num(np.asarray(chunk, dtype=np.float32).reshape(-1))
+        for chunk in chunks
+    ]
+    audio_parts = []
+    for index, chunk in enumerate(normalized_chunks):
+        audio_parts.append(chunk)
+        if index == len(normalized_chunks) - 1:
+            continue
+
+        _, trailing_s = _edge_silence_seconds(chunk, sample_rate)
+        leading_s, _ = _edge_silence_seconds(normalized_chunks[index + 1], sample_rate)
+        existing_pause_s = trailing_s + leading_s
+        padding_s = max(0.0, target_pause_s - existing_pause_s)
+        padding_samples = int(round(sample_rate * padding_s))
+        if padding_samples:
+            audio_parts.append(np.zeros(padding_samples, dtype=np.float32))
+        print(
+            f"[INFO] Biên audio {index + 1}/{len(normalized_chunks) - 1}: "
+            f"silence có sẵn={existing_pause_s:.3f}s, bù={padding_s:.3f}s"
+        )
+
+    return np.concatenate(audio_parts)
 
 
 def split_sentences_vi(text: str) -> list:
@@ -250,7 +430,9 @@ def generate_audio(text, device_choice="CPU"):
 
     # Chuẩn hóa chữ thường và biên chú thích trước khi chia câu/đưa vào model.
     # casefold() xử lý Unicode ổn định và vẫn giữ nguyên dấu tiếng Việt/dấu câu.
-    text = normalize_annotations_for_tts(text.casefold())
+    text = ensure_trailing_punctuation(
+        normalize_annotations_for_tts(text.casefold())
+    )
 
     if tts_model is None:
         return (
@@ -281,10 +463,7 @@ def generate_audio(text, device_choice="CPU"):
     if not sentences:
         sentences = [text]  # fallback: 1 câu = toàn bộ text
 
-    silence_samples = np.zeros(
-        int(TTS_SAMPLE_RATE * INTER_SENTENCE_SILENCE_S), dtype=np.float32
-    )
-    audio_parts = []
+    audio_chunks = []
     ok_count = 0
     err_msgs = []
 
@@ -296,8 +475,7 @@ def generate_audio(text, device_choice="CPU"):
         try:
             print(f"[INFO] Đang sinh câu {i+1}/{len(sentences)}: '{sent_norm[:80]}'")
             wav_arr = _infer_one_sentence(sent_norm, ref_audio, ref_text)
-            audio_parts.append(wav_arr)
-            audio_parts.append(silence_samples.copy())
+            audio_chunks.append(wav_arr)
             ok_count += 1
         except Exception as e:
             err_msgs.append(f"Câu {i+1}: {str(e)[:120]}")
@@ -305,7 +483,7 @@ def generate_audio(text, device_choice="CPU"):
             traceback.print_exc()
             continue
 
-    if not audio_parts:
+    if not audio_chunks:
         detail = "; ".join(err_msgs) if err_msgs else "Không rõ nguyên nhân."
         return (
             None,
@@ -315,7 +493,7 @@ def generate_audio(text, device_choice="CPU"):
 
     # --- Ghép audio và lưu file ---
     try:
-        full_audio = np.concatenate(audio_parts)
+        full_audio = concatenate_with_adaptive_pauses(audio_chunks)
         timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
         filename = f"tts_{timestamp}.wav"
         filepath = os.path.join(OUTPUT_DIR_ABS, filename)

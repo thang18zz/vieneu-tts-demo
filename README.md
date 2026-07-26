@@ -26,6 +26,7 @@ sử dụng model VieNeu-TTS đã được fine-tune bằng kỹ thuật LoRA.
 ## 🔊 Audio mẫu
 
 - [Nghe hoặc tải audio TTS mẫu](outputs/tts_20260726_111550.wav)
+- [Nghe hoặc tải audio TTS mẫu mới](outputs/tts_20260726_122453.wav)
 
 ## 📉 Biểu đồ loss
 
