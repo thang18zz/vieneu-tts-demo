@@ -25,11 +25,7 @@ sử dụng model VieNeu-TTS đã được fine-tune bằng kỹ thuật LoRA.
 
 ## 🔊 Audio mẫu
 
-<p><strong>Audio TTS mẫu 1</strong></p>
-<audio controls preload="none">
-  <source src="outputs/tts_20260726_111550.wav" type="audio/wav">
-  Trình duyệt của bạn không hỗ trợ phát audio.
-</audio>
+[▶️ Nghe Audio TTS mẫu 1](outputs/tts_20260726_111550.wav)
 
 ## 📉 Biểu đồ loss
 
