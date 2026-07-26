@@ -146,6 +146,13 @@ Tất cả cấu hình nằm trong file [`config.py`](config.py):
 | `LOSS_CHART_IMAGE` | Đường dẫn ảnh biểu đồ loss | `assets/loss_chart.png` |
 | `REF_AUDIO_PATH` | File audio tham chiếu | `reference/ref_audio.wav` |
 | `OUTPUT_DIR` | Thư mục lưu audio sinh ra | `outputs` |
+| `TTS_SAFE_CHUNK_TOKENS` | Ngưỡng token an toàn cho mỗi chunk | `120` |
+| `TTS_SAFE_CHUNK_WORDS` | Số từ tối đa để giữ chất lượng mỗi chunk | `30` |
+| `MAX_LEADING_SILENCE_MS` / `MAX_TRAILING_SILENCE_MS` | Silence tối đa giữ ở hai mép chunk | `80` / `120` ms |
+| `SILENCE_FRAME_MS` / `SILENCE_MIN_SPEECH_MS` | Kích thước frame và thời lượng speech tối thiểu để bỏ qua click/pop | `20` / `60` ms |
+| `MAX_INTERNAL_SILENCE_MS` / `TARGET_INTERNAL_SILENCE_MS` | Ngưỡng silence nội bộ bất thường và thời lượng giữ lại | `900` / `250` ms |
+| `REPETITION_SECONDS_PER_WORD_TRIGGER` | Ngưỡng nghi vấn để chạy ASR kiểm tra lặp | `0.65` giây/từ |
+| `REPETITION_ASR_MODEL` | Faster Whisper dùng kiểm tra transcript output | `tiny` |
 | `MODEL_INFO` | Dict thông số hiển thị Tab 1 | *(chỉnh theo model)* |
 
 ---

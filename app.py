@@ -21,6 +21,8 @@ import platform
 import subprocess
 import datetime
 import traceback
+import tempfile
+import unicodedata
 
 import gradio as gr
 import numpy as np
@@ -32,6 +34,19 @@ from config import (
     REF_AUDIO_PATH_ABS,
     OUTPUT_DIR_ABS,
     MODEL_INFO,
+    TTS_SAFE_CHUNK_TOKENS,
+    TTS_SAFE_CHUNK_WORDS,
+    MAX_LEADING_SILENCE_MS,
+    MAX_TRAILING_SILENCE_MS,
+    SILENCE_HANGOVER_MS,
+    SILENCE_FRAME_MS,
+    SILENCE_MIN_SPEECH_MS,
+    MAX_INTERNAL_SILENCE_MS,
+    TARGET_INTERNAL_SILENCE_MS,
+    REPETITION_SECONDS_PER_WORD_TRIGGER,
+    REPETITION_ASR_MODEL,
+    REPETITION_MIN_NGRAM_WORDS,
+    REPETITION_MAX_NGRAM_WORDS,
 )
 
 import re
@@ -251,6 +266,11 @@ tts_model = None
 model_load_error = None
 last_generated_file = None  # lưu đường dẫn file audio mới nhất trong phiên
 
+
+class OutputValidationError(RuntimeError):
+    """Không thể xác minh an toàn output audio nghi vấn."""
+
+
 # ============================================================================
 # 1b. MULTI-SENTENCE HELPERS
 # ============================================================================
@@ -262,28 +282,282 @@ INTER_SENTENCE_SILENCE_S = 0.20
 TTS_SAMPLE_RATE = 24000
 
 
-def _edge_silence_seconds(wav: np.ndarray, sample_rate: int) -> tuple[float, float]:
-    """Đo khoảng lặng liên tục ở đầu/cuối waveform mà không cắt audio."""
+def _activity_frames(
+    wav: np.ndarray,
+    sample_rate: int,
+) -> tuple[np.ndarray, int]:
+    """Phát hiện vùng có tiếng theo frame, bỏ các click/đảo âm quá ngắn."""
     audio = np.asarray(wav, dtype=np.float32).reshape(-1)
     if audio.size == 0 or sample_rate <= 0:
-        return 0.0, 0.0
+        return np.zeros(0, dtype=bool), 1
 
-    finite_audio = np.nan_to_num(audio, nan=0.0, posinf=0.0, neginf=0.0)
-    peak = float(np.max(np.abs(finite_audio)))
-    if peak == 0.0:
-        duration = finite_audio.size / sample_rate
+    audio = np.nan_to_num(audio, nan=0.0, posinf=0.0, neginf=0.0)
+    frame_size = max(1, round(sample_rate * SILENCE_FRAME_MS / 1000))
+    frame_count = int(np.ceil(audio.size / frame_size))
+    padded = np.pad(audio, (0, frame_count * frame_size - audio.size))
+    frames = padded.reshape(frame_count, frame_size)
+    rms = np.sqrt(np.mean(np.square(frames, dtype=np.float64), axis=1))
+    peak_rms = float(np.max(rms))
+    if peak_rms <= 0.0:
+        return np.zeros(frame_count, dtype=bool), frame_size
+
+    threshold = max(1e-4, peak_rms * 0.02)
+    active = rms > threshold
+    minimum_frames = max(1, int(np.ceil(SILENCE_MIN_SPEECH_MS / SILENCE_FRAME_MS)))
+
+    # Chỉ giữ các run có tiếng đủ dài; click/pop đơn lẻ không còn được xem là
+    # điểm kết thúc tiếng nói.
+    changes = np.flatnonzero(np.diff(np.r_[False, active, False]))
+    cleaned = np.zeros_like(active)
+    for start, end in changes.reshape(-1, 2):
+        if end - start >= minimum_frames:
+            cleaned[start:end] = True
+    return cleaned, frame_size
+
+
+def _edge_silence_seconds(wav: np.ndarray, sample_rate: int) -> tuple[float, float]:
+    """Đo silence mép bằng activity theo frame thay vì sample đơn lẻ."""
+    audio = np.asarray(wav, dtype=np.float32).reshape(-1)
+    active, frame_size = _activity_frames(audio, sample_rate)
+    voiced_frames = np.flatnonzero(active)
+    if voiced_frames.size == 0:
+        duration = audio.size / sample_rate if sample_rate > 0 else 0.0
         return duration, duration
 
-    # Ngưỡng tương đối có sàn nhỏ để bỏ noise nền nhưng không ăn vào âm cuối.
-    threshold = max(1e-4, peak * 0.01)
-    voiced_indices = np.flatnonzero(np.abs(finite_audio) > threshold)
-    if voiced_indices.size == 0:
-        duration = finite_audio.size / sample_rate
-        return duration, duration
-
-    leading = int(voiced_indices[0]) / sample_rate
-    trailing = int(finite_audio.size - 1 - voiced_indices[-1]) / sample_rate
+    leading = min(audio.size, int(voiced_frames[0]) * frame_size) / sample_rate
+    voiced_end = min(audio.size, (int(voiced_frames[-1]) + 1) * frame_size)
+    trailing = (audio.size - voiced_end) / sample_rate
     return leading, trailing
+
+
+def normalize_chunk_silence(
+    wav: np.ndarray,
+    sample_rate: int = TTS_SAMPLE_RATE,
+) -> np.ndarray:
+    """Cắt silence dư ở mép và rút gọn silence nội bộ dài bất thường."""
+    audio = np.nan_to_num(np.asarray(wav, dtype=np.float32).reshape(-1))
+    if audio.size == 0:
+        return audio
+
+    active, frame_size = _activity_frames(audio, sample_rate)
+    voiced_frames = np.flatnonzero(active)
+    if voiced_frames.size == 0:
+        return audio
+
+    keep_leading = max(MAX_LEADING_SILENCE_MS, SILENCE_HANGOVER_MS)
+    keep_trailing = max(MAX_TRAILING_SILENCE_MS, SILENCE_HANGOVER_MS)
+    first_voice = int(voiced_frames[0]) * frame_size
+    last_voice_end = min(audio.size, (int(voiced_frames[-1]) + 1) * frame_size)
+    start = max(0, first_voice - round(sample_rate * keep_leading / 1000))
+    end = min(
+        audio.size,
+        last_voice_end + round(sample_rate * keep_trailing / 1000),
+    )
+    edge_trimmed = audio[start:end].copy()
+
+    # Tìm các run im lặng hoàn toàn nằm giữa hai vùng speech. Chỉ rút gọn run
+    # dài bất thường; điểm nối vẫn nằm trong silence nên không cắt âm vị.
+    local_active, local_frame_size = _activity_frames(edge_trimmed, sample_rate)
+    changes = np.flatnonzero(np.diff(np.r_[True, local_active, True]))
+    silent_runs = changes.reshape(-1, 2) if changes.size else np.empty((0, 2), dtype=int)
+    max_internal_samples = round(sample_rate * MAX_INTERNAL_SILENCE_MS / 1000)
+    target_internal_samples = round(sample_rate * TARGET_INTERNAL_SILENCE_MS / 1000)
+    pieces = []
+    cursor = 0
+    longest_internal = 0
+    shortened_count = 0
+    for frame_start, frame_end in silent_runs:
+        silence_start = int(frame_start) * local_frame_size
+        silence_end = min(edge_trimmed.size, int(frame_end) * local_frame_size)
+        silence_length = silence_end - silence_start
+        if (
+            frame_start > 0
+            and frame_end < local_active.size
+            and silence_length > max_internal_samples
+        ):
+            pieces.append(edge_trimmed[cursor:silence_start])
+            pieces.append(
+                edge_trimmed[
+                    silence_start:silence_start + min(
+                        silence_length,
+                        target_internal_samples,
+                    )
+                ]
+            )
+            cursor = silence_end
+            longest_internal = max(longest_internal, silence_length)
+            shortened_count += 1
+    pieces.append(edge_trimmed[cursor:])
+    normalized = np.concatenate(pieces) if len(pieces) > 1 else edge_trimmed
+
+    leading_after, trailing_after = _edge_silence_seconds(normalized, sample_rate)
+    print(
+        f"[INFO] Silence chunk: duration={audio.size / sample_rate:.3f}s"
+        f"->{normalized.size / sample_rate:.3f}s, "
+        f"bỏ đầu={start / sample_rate:.3f}s, "
+        f"bỏ cuối={(audio.size - end) / sample_rate:.3f}s, "
+        f"mép sau={leading_after:.3f}/{trailing_after:.3f}s, "
+        f"silence nội bộ lớn nhất={longest_internal / sample_rate:.3f}s, "
+        f"đã rút gọn={shortened_count}"
+    )
+    return normalized
+
+
+# Tên cũ được giữ để các phần tích hợp/test hiện có không bị vỡ.
+trim_excess_edge_silence = normalize_chunk_silence
+
+
+def _transcript_words(text: str) -> list[str]:
+    return re.findall(r"[^\W\d_]+", text.casefold(), flags=re.UNICODE)
+
+
+def _match_words(text: str) -> list[str]:
+    """Token không dấu để ASR sai khác dấu thanh nhỏ vẫn có thể đối chiếu."""
+    normalized = unicodedata.normalize("NFD", text.casefold()).replace("đ", "d")
+    normalized = "".join(
+        character
+        for character in normalized
+        if unicodedata.category(character) != "Mn"
+    )
+    return re.findall(r"[a-z]+", normalized)
+
+
+def _ordered_word_coverage(expected_text: str, transcript: str) -> tuple[int, int, float]:
+    """Tính độ phủ theo LCS để bắt thiếu nội dung nhưng vẫn giữ đúng thứ tự."""
+    expected = _match_words(expected_text)
+    actual = _match_words(transcript)
+    if not expected:
+        return 0, 0, 1.0
+    previous = [0] * (len(actual) + 1)
+    for expected_word in expected:
+        current = [0]
+        for index, actual_word in enumerate(actual, start=1):
+            if expected_word == actual_word:
+                current.append(previous[index - 1] + 1)
+            else:
+                current.append(max(current[-1], previous[index]))
+        previous = current
+    matched = previous[-1]
+    return matched, len(expected), matched / len(expected)
+
+
+def _contains_tokens(tokens: list[str], sequence: list[str]) -> bool:
+    if not sequence or len(sequence) > len(tokens):
+        return False
+    return any(
+        tokens[index:index + len(sequence)] == sequence
+        for index in range(len(tokens) - len(sequence) + 1)
+    )
+
+
+def find_unexpected_consecutive_repetition(
+    input_text: str,
+    output_text: str,
+) -> str | None:
+    """Tìm cụm bị lặp liền nhau trong output nhưng không lặp như vậy ở input."""
+    input_tokens = _transcript_words(input_text)
+    output_tokens = _transcript_words(output_text)
+    max_ngram = min(
+        REPETITION_MAX_NGRAM_WORDS,
+        len(output_tokens) // 2,
+    )
+    for size in range(max_ngram, REPETITION_MIN_NGRAM_WORDS - 1, -1):
+        for index in range(0, len(output_tokens) - size * 2 + 1):
+            phrase = output_tokens[index:index + size]
+            if phrase != output_tokens[index + size:index + size * 2]:
+                continue
+            if not _contains_tokens(input_tokens, phrase + phrase):
+                return " ".join(phrase)
+    return None
+
+
+_repetition_asr_model = None
+
+
+def _get_repetition_asr_model():
+    global _repetition_asr_model
+    if _repetition_asr_model is None:
+        try:
+            from faster_whisper import WhisperModel
+        except ImportError as error:
+            raise RuntimeError(
+                "Thiếu faster-whisper để kiểm tra output lặp. "
+                "Hãy chạy: pip install -r requirements.txt"
+            ) from error
+        _repetition_asr_model = WhisperModel(
+            REPETITION_ASR_MODEL,
+            device="cpu",
+            compute_type="int8",
+        )
+    return _repetition_asr_model
+
+
+def transcribe_for_repetition_check(
+    wav: np.ndarray,
+    sample_rate: int = TTS_SAMPLE_RATE,
+) -> str:
+    """ASR một waveform nghi vấn để đối chiếu lặp với input."""
+    temp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as temp_file:
+            temp_path = temp_file.name
+        sf.write(temp_path, wav, samplerate=sample_rate)
+        segments, _ = _get_repetition_asr_model().transcribe(
+            temp_path,
+            language="vi",
+            condition_on_previous_text=False,
+            vad_filter=True,
+        )
+        return " ".join(segment.text.strip() for segment in segments).strip()
+    finally:
+        if temp_path and os.path.isfile(temp_path):
+            try:
+                os.unlink(temp_path)
+            except OSError:
+                pass
+
+
+def unexpected_repetition_error(
+    wav: np.ndarray,
+    input_text: str,
+    sample_rate: int = TTS_SAMPLE_RATE,
+    force_check: bool = False,
+) -> str | None:
+    """Xác minh độ phủ và lỗi lặp khi waveform có dấu hiệu bất thường."""
+    word_count = max(1, len(_transcript_words(input_text)))
+    duration_s = len(wav) / sample_rate
+    seconds_per_word = duration_s / word_count
+    if not force_check and seconds_per_word <= REPETITION_SECONDS_PER_WORD_TRIGGER:
+        return None
+
+    try:
+        transcript = transcribe_for_repetition_check(wav, sample_rate)
+    except Exception as error:
+        raise OutputValidationError(
+            f"Không thể chạy ASR kiểm tra lặp: {error}"
+        ) from error
+    matched, expected, coverage = _ordered_word_coverage(input_text, transcript)
+    print(
+        f"[INFO] ASR kiểm tra: transcript={transcript!r}, "
+        f"độ phủ={matched}/{expected} ({coverage:.0%})"
+    )
+    if not transcript.strip():
+        return (
+            f"ASR không nhận được lời nói nào "
+            f"(audio={duration_s:.2f}s, {seconds_per_word:.2f}s/từ)"
+        )
+    if coverage < 0.60:
+        return (
+            f"transcript chỉ khớp {matched}/{expected} từ theo thứ tự "
+            f"({coverage:.0%}), transcript={transcript!r}"
+        )
+    repeated_phrase = find_unexpected_consecutive_repetition(input_text, transcript)
+    if repeated_phrase:
+        return (
+            f"phát hiện cụm lặp ngoài input: “{repeated_phrase}” "
+            f"(audio={duration_s:.2f}s, {seconds_per_word:.2f}s/từ)"
+        )
+    return None
 
 
 def concatenate_with_adaptive_pauses(
@@ -325,21 +599,201 @@ def concatenate_with_adaptive_pauses(
     return np.concatenate(audio_parts)
 
 
-def split_sentences_vi(text: str) -> list:
-    """
-    Tách văn bản tiếng Việt thành danh sách câu đơn.
-    Dùng lookbehind để giữ dấu câu kết thúc (. ! ? …) kèm với câu trước.
-    Câu không kết thúc bằng dấu câu (phần còn lại) vẫn được giữ lại.
-
-    Ví dụ:
-        'Hôm nay trời đẹp. Bạn có khỏe không? Tôi khỏe!'
-        → ['Hôm nay trời đẹp.', 'Bạn có khỏe không?', 'Tôi khỏe!']
-    """
+def split_sentences_on_period(text: str) -> list[str]:
+    """Tách tại dấu chấm câu, nhưng không tách dấu chấm nằm giữa hai chữ số."""
     if not text:
         return []
-    # Tách tại vị trí SAU dấu .  !  ?  … (và khoảng trắng sau đó)
-    parts = re.split(r'(?<=[.!?\u2026])\s+', text.strip())
-    return [p.strip() for p in parts if p.strip()]
+
+    sentences = []
+    start = 0
+    # Match mọi dấu chấm trừ trường hợp đồng thời có chữ số ở cả hai phía.
+    boundary_pattern = re.compile(r"(?<!\d)\.|\.(?!\d)")
+    for match in boundary_pattern.finditer(text):
+        end = match.end()
+        sentence = text[start:end].strip()
+        if sentence:
+            sentences.append(sentence)
+        start = end
+
+    remainder = text[start:].strip()
+    if remainder:
+        sentences.append(remainder)
+    return sentences
+
+
+def count_chunk_tokens(text: str) -> int:
+    """Đếm bằng tokenizer model nếu có, nếu không dùng token chữ Unicode."""
+    tokenizer = getattr(tts_model, "tokenizer", None)
+    if tokenizer is None and tts_model is not None and hasattr(tts_model, "backbone"):
+        tokenizer = getattr(tts_model.backbone, "tokenizer", None)
+    if tokenizer is not None and hasattr(tokenizer, "encode"):
+        try:
+            return len(tokenizer.encode(text, add_special_tokens=False))
+        except TypeError:
+            return len(tokenizer.encode(text))
+        except Exception as error:
+            print(f"[WARN] Không đếm được tokenizer model, dùng fallback: {error}")
+    return len(re.findall(r"[^\W_]+", text, flags=re.UNICODE))
+
+
+def count_chunk_words(text: str) -> int:
+    """Đếm từ Unicode, không tính dấu câu."""
+    return len(re.findall(r"[^\W\d_]+", text, flags=re.UNICODE))
+
+
+def is_chunk_safe(
+    text: str,
+    max_tokens: int = TTS_SAFE_CHUNK_TOKENS,
+    max_words: int = TTS_SAFE_CHUNK_WORDS,
+) -> bool:
+    """Chunk chỉ an toàn khi đồng thời đạt giới hạn token và số từ."""
+    return (
+        count_chunk_tokens(text) <= max_tokens
+        and count_chunk_words(text) <= max_words
+    )
+
+
+def _terminal_punctuation(text: str) -> tuple[str, str]:
+    """Tách dấu kết thúc khỏi thân câu."""
+    match = re.match(r"^(.*?)([.!?\u2026;:-]+)$", text.strip(), flags=re.DOTALL)
+    if not match:
+        return text.strip(), "."
+    return match.group(1).rstrip(), match.group(2)
+
+
+def _split_at_word_boundaries(
+    text: str,
+    max_tokens: int,
+    max_words: int,
+) -> list[str]:
+    """Fallback cuối: chia tại khoảng trắng, tuyệt đối không cắt giữa từ."""
+    words = text.split()
+    chunks = []
+    current = []
+    for word in words:
+        candidate = " ".join((*current, word))
+        if current and not is_chunk_safe(candidate, max_tokens, max_words):
+            chunks.append(" ".join(current))
+            current = [word]
+        else:
+            current.append(word)
+    if current:
+        chunks.append(" ".join(current))
+    return chunks
+
+
+def split_long_chunk(
+    text: str,
+    max_tokens: int = TTS_SAFE_CHUNK_TOKENS,
+    max_words: int = TTS_SAFE_CHUNK_WORDS,
+) -> list[str]:
+    """Chia chunk quá dài tại `;`, `:` rồi mới dùng biên từ."""
+    if is_chunk_safe(text, max_tokens, max_words):
+        return [ensure_trailing_punctuation(text)]
+
+    body, final_punctuation = _terminal_punctuation(text)
+    punctuation_parts = [
+        part.strip()
+        for part in re.split(r"(?<=[;:])\s*", body)
+        if part.strip()
+    ]
+    if not punctuation_parts:
+        punctuation_parts = [body]
+
+    connector_pattern = re.compile(
+        r"\s+(?=(?:nhưng|tuy nhiên|do đó|vì vậy|trong khi|mặc dù|vì|nên)\b)",
+        flags=re.IGNORECASE,
+    )
+    semantic_parts = []
+    for part in punctuation_parts:
+        if is_chunk_safe(part, max_tokens, max_words):
+            semantic_parts.append(part)
+        else:
+            connector_parts = [
+                item.strip()
+                for item in connector_pattern.split(part)
+                if item.strip()
+            ]
+            semantic_parts.extend(connector_parts or [part])
+
+    packed = []
+    current = ""
+    for part in semantic_parts:
+        candidate = f"{current} {part}".strip()
+        if current and not is_chunk_safe(candidate, max_tokens, max_words):
+            packed.append(current)
+            current = part
+        else:
+            current = candidate
+    if current:
+        packed.append(current)
+
+    safe_chunks = []
+    for part in packed:
+        if is_chunk_safe(part, max_tokens, max_words):
+            safe_chunks.append(part)
+        else:
+            safe_chunks.extend(
+                _split_at_word_boundaries(part, max_tokens, max_words)
+            )
+
+    result = []
+    for index, part in enumerate(safe_chunks):
+        punctuation = final_punctuation if index == len(safe_chunks) - 1 else "."
+        clean_part, _ = _terminal_punctuation(part)
+        result.append(f"{clean_part}{punctuation}")
+    return result
+
+
+def split_comma_clauses(text: str) -> list[str]:
+    """Ghép tuần tự mỗi hai mệnh đề phân cách bằng dấu phẩy thành một chunk."""
+    body, final_punctuation = _terminal_punctuation(text)
+    clauses = [clause.strip() for clause in body.split(",") if clause.strip()]
+    if len(clauses) <= 1:
+        return split_long_chunk(f"{body}{final_punctuation}")
+
+    grouped = []
+    for index in range(0, len(clauses), 2):
+        group_clauses = clauses[index:index + 2]
+        group = ", ".join(group_clauses)
+        punctuation = final_punctuation if index + 2 >= len(clauses) else "."
+        group = f"{group}{punctuation}"
+        if count_chunk_tokens(group) < 5:
+            group = re.sub(r",\s*", " ", group)
+            group = re.sub(r"\s+", " ", group).strip()
+        grouped.extend(split_long_chunk(group))
+    return grouped
+
+
+def merge_short_chunks(chunks: list[str], minimum_words: int = 5) -> list[str]:
+    """Ghép mảnh ngắn với chunk trước trong cùng câu nếu vẫn an toàn."""
+    merged: list[str] = []
+    for chunk in chunks:
+        if count_chunk_words(chunk) >= minimum_words or not merged:
+            merged.append(chunk)
+            continue
+
+        previous_body, _ = _terminal_punctuation(merged[-1])
+        current_body, current_punctuation = _terminal_punctuation(chunk)
+        candidate = f"{previous_body}, {current_body}{current_punctuation}"
+        if is_chunk_safe(candidate):
+            print(
+                f"[INFO] Ghép mảnh ngắn {count_chunk_words(chunk)} từ vào chunk trước: "
+                f"{chunk!r}"
+            )
+            merged[-1] = candidate
+        else:
+            merged.append(chunk)
+
+    # Mảnh đầu tiên chỉ có thể ghép sang phải; trường hợp này hiếm nhưng vẫn
+    # phải giữ trong cùng câu gốc và không chèn nội dung giả.
+    if len(merged) > 1 and count_chunk_words(merged[0]) < minimum_words:
+        first_body, _ = _terminal_punctuation(merged[0])
+        second_body, second_punctuation = _terminal_punctuation(merged[1])
+        candidate = f"{first_body}, {second_body}{second_punctuation}"
+        if is_chunk_safe(candidate):
+            merged[:2] = [candidate]
+    return merged
 
 
 def _infer_one_sentence(text_norm: str, ref_audio: str, ref_text: str):
@@ -458,25 +912,75 @@ def generate_audio(text, device_choice="CPU"):
                 gr.update(interactive=True),
             )
 
-    # --- Tách câu, normalize từng câu, infer từng câu ---
-    sentences = split_sentences_vi(text)
+    # --- Tách tại dấu chấm, chuẩn hóa và infer từng câu ---
+    sentences = split_sentences_on_period(text)
     if not sentences:
-        sentences = [text]  # fallback: 1 câu = toàn bộ text
+        sentences = [text]
+
+    prepared_chunks = []
+    for sentence in sentences:
+        sentence_norm = normalize_text_for_tts(sentence)
+        if sentence_norm:
+            sentence_chunks = split_comma_clauses(sentence_norm)
+            prepared_chunks.extend(merge_short_chunks(sentence_chunks))
+    sentences = prepared_chunks
 
     audio_chunks = []
     ok_count = 0
     err_msgs = []
 
     for i, sent in enumerate(sentences):
-        sent_norm = normalize_text_for_tts(sent)
+        sent_norm = sent
         if not sent_norm:
             print(f"[INFO] Bỏ qua câu {i+1} (rỗng sau chuẩn hóa): '{sent[:60]}'")
             continue
         try:
             print(f"[INFO] Đang sinh câu {i+1}/{len(sentences)}: '{sent_norm[:80]}'")
-            wav_arr = _infer_one_sentence(sent_norm, ref_audio, ref_text)
+            raw_wav_arr = _infer_one_sentence(sent_norm, ref_audio, ref_text)
+            raw_duration_s = len(raw_wav_arr) / TTS_SAMPLE_RATE
+            wav_arr = raw_wav_arr
+            wav_arr = trim_excess_edge_silence(wav_arr)
+            force_validation = (
+                raw_duration_s > max(3.0, len(wav_arr) / TTS_SAMPLE_RATE * 1.8)
+            )
+            repetition_error = unexpected_repetition_error(
+                wav_arr,
+                sent_norm,
+                force_check=force_validation,
+            )
+            if repetition_error:
+                print(
+                    f"[WARN] Output câu {i + 1} không hợp lệ: {repetition_error}. "
+                    "Retry 1/1."
+                )
+                raw_wav_arr = _infer_one_sentence(sent_norm, ref_audio, ref_text)
+                raw_duration_s = len(raw_wav_arr) / TTS_SAMPLE_RATE
+                wav_arr = raw_wav_arr
+                wav_arr = trim_excess_edge_silence(wav_arr)
+                retry_force_validation = (
+                    raw_duration_s > max(3.0, len(wav_arr) / TTS_SAMPLE_RATE * 1.8)
+                )
+                retry_error = unexpected_repetition_error(
+                    wav_arr,
+                    sent_norm,
+                    force_check=retry_force_validation,
+                )
+                if retry_error:
+                    message = (
+                        f"❌ Output câu {i + 1}/{len(sentences)} vẫn sai sau retry 1/1: "
+                        f"{retry_error}. Không lưu audio chưa đầy đủ."
+                    )
+                    print(f"[ERROR] {message}")
+                    return None, message, gr.update(interactive=True)
             audio_chunks.append(wav_arr)
             ok_count += 1
+        except OutputValidationError as e:
+            message = (
+                f"❌ Không xác minh được output câu {i + 1}/{len(sentences)}: "
+                f"{e}. Không lưu audio chưa đầy đủ."
+            )
+            print(f"[ERROR] {message}")
+            return None, message, gr.update(interactive=True)
         except Exception as e:
             err_msgs.append(f"Câu {i+1}: {str(e)[:120]}")
             print(f"[WARN] Lỗi sinh câu {i+1}: {e}")
@@ -581,11 +1085,37 @@ CUSTOM_CSS = """
 }
 
 /* --- Global --- */
+html {
+    overflow-y: scroll;
+    scrollbar-gutter: stable;
+}
+
+html, body {
+    width: 100%;
+    max-width: 100%;
+    overflow-x: hidden;
+}
+
+*, *::before, *::after {
+    box-sizing: border-box;
+}
+
 .gradio-container {
     background: var(--bg-primary) !important;
     font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif !important;
+    width: 100% !important;
     max-width: 960px !important;
+    min-width: 0 !important;
     margin: 0 auto !important;
+    overflow-x: clip !important;
+}
+
+.gradio-container .row,
+.gradio-container .column,
+.gradio-container .form,
+.gradio-container .block {
+    min-width: 0 !important;
+    max-width: 100% !important;
 }
 
 .dark {
@@ -856,6 +1386,10 @@ CUSTOM_CSS = """
 
 /* --- Audio Player --- */
 .audio-player {
+    width: 100% !important;
+    max-width: 100% !important;
+    min-width: 0 !important;
+    min-height: 112px;
     border-radius: var(--radius-md) !important;
     overflow: hidden;
 }
@@ -867,8 +1401,20 @@ CUSTOM_CSS = """
 
 /* --- Status Messages --- */
 .status-box {
+    width: 100% !important;
+    max-width: 100% !important;
+    min-width: 0 !important;
+    min-height: 84px;
     font-family: 'JetBrains Mono', monospace !important;
     font-size: 0.85rem !important;
+    overflow-wrap: anywhere !important;
+    word-break: break-word !important;
+}
+
+.status-box textarea,
+.status-box input {
+    white-space: pre-wrap !important;
+    overflow-wrap: anywhere !important;
 }
 
 /* --- Warning Box --- */
@@ -936,6 +1482,16 @@ CUSTOM_CSS = """
     .training-table td {
         padding: 10px 14px;
         font-size: 0.82rem;
+    }
+}
+
+@media (prefers-reduced-motion: reduce) {
+    .gradio-container::before,
+    .hero-icon {
+        animation: none !important;
+    }
+    .gradio-container * {
+        transition-duration: 0.01ms !important;
     }
 }
 
